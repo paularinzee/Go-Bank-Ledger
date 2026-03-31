@@ -6,7 +6,7 @@ resolve_db_url() {
     db_url="${DB_URL:-}"
 
     if [ -z "$db_url" ]; then
-        for candidate in INTERNAL_DATABASE_URL RENDER_DATABASE_URL DATABASE_URL; do
+        for candidate in INTERNAL_DATABASE_URL RDS_DATABASE_URL DATABASE_URL; do
             eval value="\${$candidate:-}"
             if [ -n "$value" ]; then
                 db_url="$value"
@@ -17,7 +17,7 @@ resolve_db_url() {
 
     case "$db_url" in
         *@localhost:*|*@127.0.0.1:*|*@\[::1\]:*)
-            for candidate in INTERNAL_DATABASE_URL RENDER_DATABASE_URL DATABASE_URL; do
+            for candidate in INTERNAL_DATABASE_URL RDS_DATABASE_URL DATABASE_URL; do
                 eval value="\${$candidate:-}"
                 if [ -n "$value" ]; then
                     db_url="$value"
@@ -53,7 +53,7 @@ if [ "${RUN_DB_MIGRATIONS_ON_START:-true}" = "true" ] && [ -n "${db_url:-}" ]; t
 
     while [ "$attempt" -le "$max_attempts" ]; do
         set +e
-        migration_output=$(migrate -path /app/postgres/migrations -database "$migrate_db_url" up 2>&1)
+        migration_output=$(migrate -path /app/db/migrations -database "$migrate_db_url" up 2>&1)
         migration_status=$?
         set -e
 

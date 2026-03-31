@@ -68,7 +68,7 @@ func resolveDBURL() string {
 	// Prefer DB_URL, but support platform-specific fallbacks for easier deployment.
 	connStr := strings.TrimSpace(os.Getenv("DB_URL"))
 
-	fallbackVars := []string{"INTERNAL_DATABASE_URL", "RENDER_DATABASE_URL", "DATABASE_URL"}
+	fallbackVars := []string{"INTERNAL_DATABASE_URL", "RDS_DATABASE_URL", "DATABASE_URL"}
 
 	if connStr == "" {
 		// If DB_URL is absent, try common provider-specific environment variables.
@@ -87,7 +87,7 @@ func resolveDBURL() string {
 		}
 
 		// Default connection string for local development only.
-		return "postgresql://root:secret@localhost:5432/simple_ledger?sslmode=disable" // #nosec G101 - Local development default
+		return "postgresql://root:secret@localhost:5432/bank_ledger?sslmode=disable" // #nosec G101 - Local development default
 	}
 
 	lower := strings.ToLower(connStr)
