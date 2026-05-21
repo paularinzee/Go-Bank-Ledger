@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -14,6 +16,9 @@ import (
 	"github.com/go-chi/cors"
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/joho/godotenv"
+
+	// FIX 2: Explicitly import pq driver side-effects to register "postgres" with database/sql
+	_ "github.com/lib/pq"
 	_ "github.com/paularinzee/bank-ledger/docs"
 	"github.com/paularinzee/bank-ledger/internal/api"
 	"github.com/paularinzee/bank-ledger/internal/db"
@@ -31,7 +36,6 @@ func initLogger() {
 }
 
 func parseAllowedOrigins() []string {
-	// Allow explicit runtime configuration; defaults are safe for hosted frontend + local dev.
 	origins := os.Getenv("CORS_ALLOWED_ORIGINS")
 	if strings.TrimSpace(origins) == "" {
 		return []string{
@@ -45,7 +49,6 @@ func parseAllowedOrigins() []string {
 	parts := strings.Split(origins, ",")
 	allowed := make([]string, 0, len(parts))
 	for _, origin := range parts {
-		// Normalize each origin to avoid accidental whitespace mismatches.
 		trimmed := strings.TrimSpace(origin)
 		if trimmed != "" {
 			allowed = append(allowed, trimmed)
@@ -65,13 +68,10 @@ func parseAllowedOrigins() []string {
 }
 
 func resolveDBURL() string {
-	// Prefer DB_URL, but support platform-specific fallbacks for easier deployment.
 	connStr := strings.TrimSpace(os.Getenv("DB_URL"))
-
 	fallbackVars := []string{"INTERNAL_DATABASE_URL", "RDS_DATABASE_URL", "DATABASE_URL"}
 
 	if connStr == "" {
-		// If DB_URL is absent, try common provider-specific environment variables.
 		for _, envVar := range fallbackVars {
 			if value := strings.TrimSpace(os.Getenv(envVar)); value != "" {
 				return value
@@ -86,12 +86,10 @@ func resolveDBURL() string {
 			)
 		}
 
-		// Default connection string for local development only.
-		return "postgresql://root:secret@localhost:5432/bank_ledger?sslmode=disable" // #nosec G101 - Local development default
+		return "postgresql://root:secret@localhost:5432/bank_ledger?sslmode=disable"
 	}
 
 	lower := strings.ToLower(connStr)
-	// Localhost DB URLs are invalid in cloud runtimes; attempt safe fallback automatically.
 	isLocalHostURL := strings.Contains(lower, "@localhost:") || strings.Contains(lower, "@127.0.0.1:") || strings.Contains(lower, "@[::1]:")
 	if isLocalHostURL {
 		for _, envVar := range fallbackVars {
@@ -111,8 +109,16 @@ func resolveDBURL() string {
 	return connStr
 }
 
-func main() {
+// @title           Bank Ledger API
+// @version         1.0
+// @description     Production-grade double-entry accounting ledger
 
+// @securityDefinitions.apikey Bearer
+// @in                         header
+// @name                       Authorization
+// @description                Type 'Bearer <your_jwt_token>' to authenticate
+
+func main() {
 	// Capture startup time so health endpoint can report uptime.
 	startTime := time.Now()
 
@@ -126,15 +132,21 @@ func main() {
 		zlog.Fatal().Err(err).Msg("Failed to initialize JWT auth")
 	}
 
-	// Build DB connection string and validate connectivity before serving traffic.
 	connStr := resolveDBURL()
 	if strings.Contains(connStr, "@localhost:") || strings.Contains(connStr, "@127.0.0.1:") || strings.Contains(connStr, "@[::1]:") {
 		zlog.Warn().Msg("Using localhost DB_URL; this is only valid for local development")
 	}
+
 	dbConn, err := sql.Open("postgres", connStr)
 	if err != nil {
 		zlog.Fatal().Err(err).Msg("Failed to open DB connection")
 	}
+
+	// FIX 5: Hardening connection limits to prevent exhaustion of DB resources
+	dbConn.SetMaxOpenConns(25)                  // Max concurrent active connections
+	dbConn.SetMaxIdleConns(25)                  // Keeps a warm pool of connections ready
+	dbConn.SetConnMaxLifetime(10 * time.Minute) // recycles connection handlers to pick up network updates
+	dbConn.SetConnMaxIdleTime(5 * time.Minute)
 
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer pingCancel()
@@ -143,24 +155,39 @@ func main() {
 	}
 	zlog.Info().Msg("Database connectivity verified")
 
-	defer func() {
-		if closeErr := dbConn.Close(); closeErr != nil {
-			zlog.Error().Err(closeErr).Msg("Failed to close DB connection")
-		}
-	}()
-
 	store := db.NewStore(dbConn)
 	ledgerSvc := service.NewLedgerService(store)
-
-	// Wire HTTP handlers with service and persistence dependencies.
 	h := api.NewHandler(ledgerSvc, store)
 
 	r := chi.NewRouter()
-	r.Use(middleware.Logger)
+
+	// Core infrastructure middleware handlers
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RequestID)
 
-	// CORS middleware for separate frontend deployments and local development.
+	// FIX 3: Consolidated custom JSON logger replacing the noisy plain-text middleware.Logger
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			reqID := middleware.GetReqID(r.Context())
+			start := time.Now()
+
+			zlog.Info().
+				Str("request_id", reqID).
+				Str("method", r.Method).
+				Str("path", r.URL.Path).
+				Str("remote_ip", r.RemoteAddr).
+				Msg("HTTP request received")
+
+			next.ServeHTTP(w, r)
+
+			zlog.Info().
+				Str("request_id", reqID).
+				Str("path", r.URL.Path).
+				Dur("duration_ms", time.Since(start)).
+				Msg("HTTP request completed")
+		})
+	})
+
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   parseAllowedOrigins(),
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
@@ -170,21 +197,10 @@ func main() {
 		MaxAge:           300,
 	}))
 
-	r.Use(func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Attach request metadata to logs for traceability during debugging.
-			reqID := middleware.GetReqID(r.Context())
-			zlog.Info().Str("request_id", reqID).Str("path", r.URL.Path).Msg("Request received")
-			next.ServeHTTP(w, r)
-		})
-	})
-
 	// Public routes
 	r.Post("/register", h.Register)
 	r.Post("/login", h.Login)
 	r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
-		// Health returns service liveness plus lightweight runtime metadata.
-		zlog.Info().Msg("Health check requested")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		if err := json.NewEncoder(w).Encode(map[string]string{
@@ -196,13 +212,20 @@ func main() {
 		}
 	})
 
-	r.Get("/swagger/*", httpSwagger.Handler(
-		httpSwagger.URL("/swagger/doc.json"),
-		httpSwagger.DeepLinking(true),
-	))
+	// FIX 4: Explicit route fallback handling to prevent 404 errors on trailing slash variations
+	r.Get("/swagger", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/swagger/index.html", http.StatusMovedPermanently)
+	})
+	// Use Mount instead of Get with a wildcard string
+
+	r.Mount("/swagger", httpSwagger.WrapHandler)
+	// r.Get("/swagger/*", httpSwagger.Handler(
+	// 	httpSwagger.URL("/swagger/doc.json"),
+	// 	httpSwagger.DeepLinking(true),
+	// ))
+
 	// Protected routes
 	r.Group(func(r chi.Router) {
-		// Apply JWT verification only to protected business endpoints.
 		r.Use(jwtauth.Verifier(api.TokenAuth))
 		r.Use(jwtauth.Authenticator(api.TokenAuth))
 
@@ -219,11 +242,9 @@ func main() {
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		// Default port for local development when PORT is not injected.
 		port = "8080"
 	}
 
-	// Configure HTTP server with timeouts for security
 	srv := &http.Server{
 		Addr:              ":" + port,
 		Handler:           r,
@@ -233,9 +254,37 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	zlog.Info().Str("port", port).Msg("Starting server")
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		zlog.Fatal().Err(err).Msg("Server failed to start")
-	}
+	// FIX 1: Running the network socket worker step inside a non-blocking background routine
+	serverErrors := make(chan error, 1)
+	go func() {
+		zlog.Info().Str("port", port).Msg("Starting server")
+		serverErrors <- srv.ListenAndServe()
+	}()
 
+	// Intercept execution trap signals coming from OS orchestration layers (Docker, Render, k8s)
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case err := <-serverErrors:
+		zlog.Fatal().Err(err).Msg("Server forced premature structural closure")
+
+	case sig := <-shutdown:
+		zlog.Info().Str("signal", sig.String()).Msg("Graceful shutdown sequence initialized...")
+
+		// Provide a 15-second grace window for mid-flight database entry writes to safely commit
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		if err := srv.Shutdown(ctx); err != nil {
+			zlog.Error().Err(err).Msg("Graceful listener wrap up failed; forcing socket close")
+			_ = srv.Close()
+		}
+
+		// Close connection pool gracefully down to zero connections
+		if err := dbConn.Close(); err != nil {
+			zlog.Error().Err(err).Msg("Error encountered while recycling connection pools")
+		}
+	}
+	zlog.Info().Msg("Server stopped completely")
 }
