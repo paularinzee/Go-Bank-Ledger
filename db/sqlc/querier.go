@@ -13,11 +13,13 @@ import (
 type Querier interface {
 	CreateAccount(ctx context.Context, arg CreateAccountParams) (Account, error)
 	CreateEntry(ctx context.Context, arg CreateEntryParams) (Entry, error)
+	CreateIdempotencyKey(ctx context.Context, arg CreateIdempotencyKeyParams) (IdempotencyKey, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (CreateUserRow, error)
 	GetAccount(ctx context.Context, id uuid.UUID) (Account, error)
 	// lock prevents concurrent transactions from reading a stale balance.
 	GetAccountBalance(ctx context.Context, accountID uuid.UUID) (string, error)
 	GetAccountForUpdate(ctx context.Context, id uuid.UUID) (Account, error)
+	GetIdempotencyKey(ctx context.Context, arg GetIdempotencyKeyParams) (IdempotencyKey, error)
 	GetSettlementAccount(ctx context.Context) (Account, error)
 	GetSettlementAccountForUpdate(ctx context.Context) (Account, error)
 	GetUserByEmail(ctx context.Context, email string) (User, error)

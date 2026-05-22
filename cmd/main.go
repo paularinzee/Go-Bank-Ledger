@@ -192,7 +192,7 @@ func main() {
 		AllowedOrigins:   parseAllowedOrigins(),
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
-		ExposedHeaders:   []string{"Link"},
+		ExposedHeaders:   []string{"Link", "X-Cache-Idempotency"},
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
@@ -228,6 +228,9 @@ func main() {
 	r.Group(func(r chi.Router) {
 		r.Use(jwtauth.Verifier(api.TokenAuth))
 		r.Use(jwtauth.Authenticator(api.TokenAuth))
+
+		// 2. Validate and intercept duplicate transaction requests
+		r.Use(h.IdempotencyMiddleware)
 
 		r.Post("/accounts", h.CreateAccount)
 		r.Get("/accounts", h.ListAccounts)

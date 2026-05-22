@@ -6,6 +6,7 @@ package sqlc
 
 import (
 	"database/sql"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -29,6 +30,14 @@ type Entry struct {
 	OperationType string         `json:"operation_type"`
 	Description   sql.NullString `json:"description"`
 	CreatedAt     sql.NullTime   `json:"created_at"`
+}
+
+type IdempotencyKey struct {
+	ID           string    `json:"id"`
+	UserID       uuid.UUID `json:"user_id"`
+	ResponseCode int32     `json:"response_code"`
+	ResponseBody []byte    `json:"response_body"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 type User struct {
