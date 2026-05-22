@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/jwtauth/v5"
@@ -270,6 +271,14 @@ func (h *Handler) GetAccount(w http.ResponseWriter, r *http.Request) {
 // @Router       /accounts/{id}/deposit [post]
 
 func (h *Handler) Deposit(w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	operation := "deposit"
+
+	// Ensure latency is recorded when the handler returns
+	defer func() {
+		TransactionLatency.WithLabelValues(operation).Observe(time.Since(startTime).Seconds())
+	}()
+
 	_, claims, err := jwtauth.FromContext(r.Context())
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to extract JWT from context")
@@ -343,6 +352,7 @@ func (h *Handler) Deposit(w http.ResponseWriter, r *http.Request) {
 // @Failure      401               {object}  string "Unauthorized token"
 // @Router       /accounts/{id}/withdraw [post]
 func (h *Handler) Withdraw(w http.ResponseWriter, r *http.Request) {
+
 	_, claims, err := jwtauth.FromContext(r.Context())
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to extract JWT from context")
@@ -415,6 +425,13 @@ func (h *Handler) Withdraw(w http.ResponseWriter, r *http.Request) {
 // @Failure      401               {object}  string "Unauthorized token"
 // @Router       /transfers [post]
 func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
+
+	startTime := time.Now()
+	operation := "transfer"
+
+	defer func() {
+		TransactionLatency.WithLabelValues(operation).Observe(time.Since(startTime).Seconds())
+	}()
 	_, claims, err := jwtauth.FromContext(r.Context())
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to extract JWT from context")

@@ -23,6 +23,7 @@ import (
 	"github.com/paularinzee/bank-ledger/internal/api"
 	"github.com/paularinzee/bank-ledger/internal/db"
 	"github.com/paularinzee/bank-ledger/internal/service"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
 	zlog "github.com/rs/zerolog/log"
 	httpSwagger "github.com/swaggo/http-swagger"
@@ -161,6 +162,8 @@ func main() {
 
 	r := chi.NewRouter()
 
+	// Expose standard Prometheus metrics scraping path
+	r.Handle("/metrics", promhttp.Handler())
 	// Core infrastructure middleware handlers
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RequestID)
