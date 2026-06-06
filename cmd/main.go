@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,12 +17,14 @@ import (
 	"github.com/go-chi/cors"
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/joho/godotenv"
+	"golang.org/x/time/rate"
 
 	// FIX 2: Explicitly import pq driver side-effects to register "postgres" with database/sql
 	_ "github.com/lib/pq"
 	_ "github.com/paularinzee/bank-ledger/docs"
 	"github.com/paularinzee/bank-ledger/internal/api"
 	"github.com/paularinzee/bank-ledger/internal/db"
+	"github.com/paularinzee/bank-ledger/internal/ratelimit"
 	"github.com/paularinzee/bank-ledger/internal/service"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
@@ -37,6 +40,15 @@ func initLogger() {
 }
 
 func parseAllowedOrigins() []string {
+	// In production, restrict origins
+	if os.Getenv("ENVIRONMENT") == "production" {
+		if prodURL := os.Getenv("PROD_FRONTEND_URL"); prodURL != "" {
+			return []string{prodURL}
+		}
+		// Fallback to no CORS in production if not specified (better to be restrictive)
+		return []string{}
+	}
+
 	origins := os.Getenv("CORS_ALLOWED_ORIGINS")
 	if strings.TrimSpace(origins) == "" {
 		return []string{
@@ -110,10 +122,77 @@ func resolveDBURL() string {
 	return connStr
 }
 
+func validateEnvironment() error {
+	required := []string{"JWT_SECRET"}
+	if os.Getenv("ENVIRONMENT") == "production" {
+		required = append(required, "PROD_FRONTEND_URL")
+	}
+
+	var missing []string
+	for _, env := range required {
+		if strings.TrimSpace(os.Getenv(env)) == "" {
+			missing = append(missing, env)
+		}
+	}
+
+	if len(missing) > 0 {
+		return fmt.Errorf("missing required environment variables: %v", missing)
+	}
+	return nil
+}
+
+// securityHeaders adds security-related headers to all responses
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// requestSizeLimiter limits the size of incoming requests
+func requestSizeLimiter(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1048576) // 1MB limit
+		next.ServeHTTP(w, r)
+	})
+}
+
+// loggingMiddleware provides structured logging with request IDs
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqID := middleware.GetReqID(r.Context())
+		start := time.Now()
+
+		// Create a context with logger that includes request_id
+		logger := zlog.With().Str("request_id", reqID).Logger()
+		ctx := logger.WithContext(r.Context())
+
+		// Capture status code
+		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+
+		logger.Info().
+			Str("method", r.Method).
+			Str("path", r.URL.Path).
+			Str("remote_ip", r.RemoteAddr).
+			Str("user_agent", r.UserAgent()).
+			Msg("HTTP request received")
+
+		next.ServeHTTP(ww, r.WithContext(ctx))
+
+		logger.Info().
+			Int("status", ww.Status()).
+			Int("bytes", ww.BytesWritten()).
+			Dur("duration_ms", time.Since(start)).
+			Msg("HTTP request completed")
+	})
+}
+
 // @title           Bank Ledger API
 // @version         1.0
 // @description     Production-grade double-entry accounting ledger
-
 // @securityDefinitions.apikey Bearer
 // @in                         header
 // @name                       Authorization
@@ -127,6 +206,11 @@ func main() {
 
 	if err := godotenv.Load(); err != nil {
 		zlog.Warn().Err(err).Msg("No .env file found – using system env")
+	}
+
+	// Validate required environment variables
+	if err := validateEnvironment(); err != nil {
+		zlog.Fatal().Err(err).Msg("Environment validation failed")
 	}
 
 	if err := api.InitTokenAuthFromEnv(); err != nil {
@@ -164,32 +248,13 @@ func main() {
 
 	// Expose standard Prometheus metrics scraping path
 	r.Handle("/metrics", promhttp.Handler())
+
 	// Core infrastructure middleware handlers
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RequestID)
-
-	// FIX 3: Consolidated custom JSON logger replacing the noisy plain-text middleware.Logger
-	r.Use(func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			reqID := middleware.GetReqID(r.Context())
-			start := time.Now()
-
-			zlog.Info().
-				Str("request_id", reqID).
-				Str("method", r.Method).
-				Str("path", r.URL.Path).
-				Str("remote_ip", r.RemoteAddr).
-				Msg("HTTP request received")
-
-			next.ServeHTTP(w, r)
-
-			zlog.Info().
-				Str("request_id", reqID).
-				Str("path", r.URL.Path).
-				Dur("duration_ms", time.Since(start)).
-				Msg("HTTP request completed")
-		})
-	})
+	r.Use(securityHeaders)
+	r.Use(requestSizeLimiter)
+	r.Use(loggingMiddleware)
 
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   parseAllowedOrigins(),
@@ -200,39 +265,75 @@ func main() {
 		MaxAge:           300,
 	}))
 
+	// Create rate limiters with different strategies
+	globalLimiter := ratelimit.NewRateLimiter(
+		rate.Limit(100), // 100 requests per second
+		50,              // burst of 50
+		10*time.Minute,  // keep inactive clients for 10 minutes
+	)
+
+	// Create endpoint-specific rate limiter
+	endpointLimiter := ratelimit.NewEndpointRateLimiter()
+	endpointLimiter.SetEndpointRate("/login", rate.Limit(5), 3, 15*time.Minute)         // 5 req/sec for login
+	endpointLimiter.SetEndpointRate("/register", rate.Limit(3), 2, 30*time.Minute)      // 3 req/sec for register
+	endpointLimiter.SetEndpointRate("/accounts/*", rate.Limit(200), 100, 5*time.Minute) // Higher for account operations
+
+	// Apply global rate limiter middleware
+	r.Use(globalLimiter.Middleware())
+
 	// Public routes
 	r.Post("/register", h.Register)
 	r.Post("/login", h.Login)
-	r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		if err := json.NewEncoder(w).Encode(map[string]string{
+
+	// Health check endpoint with dependency checks
+	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+		health := map[string]interface{}{
 			"status":  "healthy",
-			"version": "0.1.0",
+			"version": "1.0.0",
 			"uptime":  time.Since(startTime).String(),
-		}); err != nil {
-			zlog.Error().Err(err).Msg("Failed to encode health check response")
+			"checks":  map[string]string{},
 		}
+
+		// Check database connectivity
+		if err := dbConn.PingContext(r.Context()); err != nil {
+			health["status"] = "unhealthy"
+			health["checks"].(map[string]string)["database"] = "failed: " + err.Error()
+			w.WriteHeader(http.StatusServiceUnavailable)
+		} else {
+			health["checks"].(map[string]string)["database"] = "connected"
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(health)
+	})
+
+	// Readiness probe endpoint for orchestration
+	r.Get("/ready", func(w http.ResponseWriter, r *http.Request) {
+		// Check if database is ready
+		if err := dbConn.PingContext(r.Context()); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte("database not ready"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ready"))
 	})
 
 	// FIX 4: Explicit route fallback handling to prevent 404 errors on trailing slash variations
 	r.Get("/swagger", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/swagger/index.html", http.StatusMovedPermanently)
 	})
-	// Use Mount instead of Get with a wildcard string
 
+	// Mount Swagger documentation
 	r.Mount("/swagger", httpSwagger.WrapHandler)
-	// r.Get("/swagger/*", httpSwagger.Handler(
-	// 	httpSwagger.URL("/swagger/doc.json"),
-	// 	httpSwagger.DeepLinking(true),
-	// ))
 
 	// Protected routes
 	r.Group(func(r chi.Router) {
 		r.Use(jwtauth.Verifier(api.TokenAuth))
 		r.Use(jwtauth.Authenticator(api.TokenAuth))
+		r.Use(endpointLimiter.Middleware()) // Apply endpoint-specific rate limiting
 
-		// 2. Validate and intercept duplicate transaction requests
+		// Validate and intercept duplicate transaction requests
 		r.Use(h.IdempotencyMiddleware)
 
 		r.Post("/accounts", h.CreateAccount)
@@ -278,13 +379,27 @@ func main() {
 	case sig := <-shutdown:
 		zlog.Info().Str("signal", sig.String()).Msg("Graceful shutdown sequence initialized...")
 
-		// Provide a 15-second grace window for mid-flight database entry writes to safely commit
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		// Provide a 30-second grace window for mid-flight database entry writes to safely commit
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
+		// Gracefully shutdown the HTTP server
 		if err := srv.Shutdown(ctx); err != nil {
 			zlog.Error().Err(err).Msg("Graceful listener wrap up failed; forcing socket close")
 			_ = srv.Close()
+		}
+
+		// Cleanup rate limiter resources if they support Close
+		if closer, ok := globalLimiter.(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil {
+				zlog.Error().Err(err).Msg("Error closing global rate limiter")
+			}
+		}
+
+		if closer, ok := endpointLimiter.(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil {
+				zlog.Error().Err(err).Msg("Error closing endpoint rate limiter")
+			}
 		}
 
 		// Close connection pool gracefully down to zero connections
